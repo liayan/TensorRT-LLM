@@ -763,11 +763,70 @@ class AutoTunerProfilingCache:
             "device_capability": self.device_capability,
         }
 
+    @staticmethod
+    def _normalize_metadata_value(value: Any) -> Any:
+        """Canonicalize a metadata value for comparison.
+
+        JSON round-trips tuples to lists, so ``device_capability`` comes back
+        as ``[10, 0]`` where the live value is ``(10, 0)``.
+        """
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                AutoTunerProfilingCache._normalize_metadata_value(v)
+                for v in value)
+        return value
+
     def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
-        self.lib_version = metadata["lib_version"]
-        self.creation_timestamp = metadata["creation_timestamp"]
-        self.device_name = metadata["device_name"]
-        self.device_capability = metadata["device_capability"]
+        """Validate a cache file's metadata against the running environment.
+
+        A cache profiled by a different TensorRT-LLM build, or on a different
+        GPU, is not portable. Its keys mostly miss, so every rank re-profiles
+        and re-saves the file, and the only symptom in the log is that tuning
+        became slow again. Entries that do hit are worse: they hand back
+        tactics that were never measured on the device in front of us. Neither
+        case surfaces as an error today, which makes a stale cache
+        indistinguishable from a flaky machine.
+
+        Mismatches are reported as warnings by default; set
+        ``TLLM_AUTOTUNER_STRICT_CACHE=1`` to turn them into a hard error.
+
+        The metadata describing *this* process is deliberately left in place
+        rather than overwritten with the file's values, so a cache re-saved
+        from here describes the run that wrote it instead of inheriting the
+        stale file's provenance.
+        """
+        current = {
+            "lib_version": self.lib_version,
+            "device_name": self.device_name,
+            "device_capability": self.device_capability,
+        }
+
+        mismatches = []
+        for key, live_value in current.items():
+            if key not in metadata:
+                mismatches.append(
+                    f"{key}: absent from the cache file, running environment "
+                    f"has {live_value!r}")
+                continue
+            cached_value = self._normalize_metadata_value(metadata[key])
+            if cached_value != self._normalize_metadata_value(live_value):
+                mismatches.append(f"{key}: cache has {cached_value!r}, "
+                                  f"running environment has {live_value!r}")
+
+        if not mismatches:
+            return
+
+        message = (
+            "[AutoTuner] The profiling cache was produced by a different "
+            f"environment ({'; '.join(mismatches)}). Tactics measured for "
+            "another build or another GPU are not portable: expect cache "
+            "misses and re-profiling, or tactics that were never timed on this "
+            "device. Use a separate cache file per (build, GPU) combination. "
+            "Set TLLM_AUTOTUNER_STRICT_CACHE=1 to make this an error.")
+
+        if os.getenv("TLLM_AUTOTUNER_STRICT_CACHE", "0") == "1":
+            raise ValueError(message)
+        logger.warning(message)
 
     def _serialize_cache_data(self,
                               cache: Optional[Dict[Tuple, Tuple]] = None

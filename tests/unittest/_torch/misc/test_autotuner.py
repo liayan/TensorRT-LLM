@@ -582,6 +582,88 @@ def test_load_cache_skips_non_literal_tactic():
     assert bad not in cache.cache
 
 
+def _write_cache_doc(metadata, entry_key="('op', 'R', '0', ((1, 128),))"):
+    """Write a minimal one-entry cache file with the given metadata block."""
+    doc = {
+        "shared": {},
+        "rank_0": {
+            entry_key: {
+                "runner_id": 0,
+                "tactic": "7",
+                "min_time": 0.001
+            }
+        },
+    }
+    if metadata is not None:
+        doc["metadata"] = metadata
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+    # Keep the TemporaryDirectory alive for the caller's lifetime.
+    return cache_path, temp_dir
+
+
+def test_load_cache_environment_mismatch_is_reported(monkeypatch):
+    """A cache from a different build/GPU must be reported, not silently trusted.
+
+    The metadata block records lib_version / device_name / device_capability,
+    but nothing compared it against the running process: a cache built for
+    another image or another GPU loaded clean, mostly missed, and the only
+    trace was that tuning got slow again -- a failure mode that reads exactly
+    like flaky hardware.
+    """
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+
+    stale_metadata = dict(cache._serialize_metadata())
+    stale_metadata["device_name"] = "NVIDIA Totally Different GPU"
+    stale_metadata["lib_version"] = "0.0.0-not-this-build"
+    cache_path, _tmp = _write_cache_doc(stale_metadata)
+
+    # Default: warn and keep going -- loading a mismatched cache still works.
+    monkeypatch.delenv("TLLM_AUTOTUNER_STRICT_CACHE", raising=False)
+    cache.load_cache(cache_path, rank=0)
+    assert ("op", "R", "0", ((1, 128), )) in cache.cache
+
+    # The live metadata must NOT be overwritten by the stale file's values,
+    # otherwise re-saving propagates the wrong provenance.
+    assert cache.device_name == torch.cuda.get_device_name()
+    assert cache.lib_version == tensorrt_llm.__version__
+
+    # Strict mode: the same file is a hard error.
+    monkeypatch.setenv("TLLM_AUTOTUNER_STRICT_CACHE", "1")
+    with pytest.raises(ValueError, match="different environment"):
+        cache.load_cache(cache_path, rank=0)
+
+
+def test_load_cache_matching_metadata_is_accepted(monkeypatch):
+    """The happy path must stay silent even under strict mode."""
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    cache_path, _tmp = _write_cache_doc(cache._serialize_metadata())
+
+    monkeypatch.setenv("TLLM_AUTOTUNER_STRICT_CACHE", "1")
+    cache.load_cache(cache_path, rank=0)
+    assert ("op", "R", "0", ((1, 128), )) in cache.cache
+
+
+def test_load_cache_without_metadata_does_not_raise(monkeypatch):
+    """A metadata-less cache file must degrade to a warning, not a KeyError.
+
+    ``load_cache`` passes ``contents.get("metadata", {})``, so a file written
+    without a metadata block used to reach ``metadata["lib_version"]`` and
+    raise ``KeyError`` out of the load.
+    """
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    cache_path, _tmp = _write_cache_doc(None)
+
+    monkeypatch.delenv("TLLM_AUTOTUNER_STRICT_CACHE", raising=False)
+    cache.load_cache(cache_path, rank=0)
+    assert ("op", "R", "0", ((1, 128), )) in cache.cache
+
+
 def test_kernel_testing_single_context():
     """Test kernel testing with a single choose_one context"""
     x, w = torch.randn(16, 64), torch.randn(64, 128)
